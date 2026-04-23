@@ -1,0 +1,344 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import customtkinter as ctk
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import pymongo
+import json
+import os
+from datetime import datetime
+
+
+# ==========================================
+# DATABASE & FILE HANDLER SECTION
+# ==========================================
+class DataManager:
+    def __init__(self, db_name="ExpenseTrackerDB", filename="expense_history.json"):
+        self.filename = filename
+        self.db_name = db_name
+
+        # 1. MongoDB Connection (Primary Database - Requirement)
+        try:
+            self.client = pymongo.MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=2000)
+            self.client.server_info()
+            self.db = self.client[db_name]
+            self.expenses_col = self.db["expenses"]
+            self.users_col = self.db["users"]
+            self.mongo_connected = True
+
+            # Ensure at least one user exists in MongoDB
+            if self.users_col.count_documents({}) == 0:
+                self.users_col.insert_one({"name": "Default User"})
+        except Exception:
+            self.mongo_connected = False
+
+        # 2. Local File Initialization (History Backup - Requirement)
+        self.local_backup = self.load_backup()
+
+    def load_backup(self):
+        if os.path.exists(self.filename):
+            try:
+                with open(self.filename, 'r') as f:
+                    data = json.load(f)
+                    if not data.get("users"):
+                        data["users"] = ["Default User"]
+                    return data
+            except:
+                return {"users": ["Default User"], "expenses": []}
+        return {"users": ["Default User"], "expenses": []}
+
+    def save_backup(self):
+        with open(self.filename, 'w') as f:
+            json.dump(self.local_backup, f, indent=4)
+
+    def add_user(self, name):
+        success = False
+        # Primary: MongoDB
+        if self.mongo_connected:
+            if not self.users_col.find_one({"name": name}):
+                self.users_col.insert_one({"name": name})
+                success = True
+
+        # Backup: Local File
+        if name not in self.local_backup["users"]:
+            self.local_backup["users"].append(name)
+            self.save_backup()
+            success = True
+        return success
+
+    def get_users(self):
+        if self.mongo_connected:
+            users = [u["name"] for u in self.users_col.find()]
+            return users if users else ["Default User"]
+        return self.local_backup["users"]
+
+    def add_expense(self, user, amount, category, description):
+        date = datetime.now().strftime("%Y-%m-%d")
+        expense = {
+            "user": user,
+            "amount": float(amount),
+            "category": category,
+            "description": description,
+            "date": date
+        }
+
+        # Primary CRUD: Create in MongoDB
+        if self.mongo_connected:
+            self.expenses_col.insert_one(expense.copy())
+
+        # Backup: Save to History File
+        self.local_backup["expenses"].append(expense)
+        self.save_backup()
+        return True
+
+    def get_expenses(self, user=None):
+        # Primary CRUD: Read from MongoDB
+        if self.mongo_connected:
+            query = {"user": user} if user and user != "All Users" else {}
+            return list(self.expenses_col.find(query, {"_id": 0}))
+
+        # Fallback: Read from History Backup
+        all_exp = self.local_backup["expenses"]
+        if user and user != "All Users":
+            return [e for e in all_exp if e["user"] == user]
+        return all_exp
+
+
+# ==========================================
+# GUI APPLICATION SECTION
+# ==========================================
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+
+class ExpenseTrackerApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("Expense Tracker")
+        self.geometry("1100x750")
+
+        self.data_manager = DataManager()
+        self.current_user_filter = "All Users"
+
+        # Layout
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        # Sidebar
+        self.sidebar = ctk.CTkFrame(self, width=220, corner_radius=0)
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+
+        ctk.CTkLabel(self.sidebar, text="EXPENSE\nTRACKER", font=ctk.CTkFont(size=22, weight="bold"),
+                     text_color="#3498db").pack(pady=(40, 40))
+
+        self.btn_add_user = ctk.CTkButton(self.sidebar, text="+ New Person", fg_color="#8e44ad", hover_color="#732d91",
+                                          command=self.add_new_user_dialog)
+        self.btn_add_user.pack(pady=10, padx=20)
+
+        self.btn_add = ctk.CTkButton(self.sidebar, text="Add Expense", command=lambda: self.show_frame("add"))
+        self.btn_add.pack(pady=10, padx=20)
+
+        self.btn_view = ctk.CTkButton(self.sidebar, text="View History", command=lambda: self.show_frame("view"))
+        self.btn_view.pack(pady=10, padx=20)
+
+        self.btn_stats = ctk.CTkButton(self.sidebar, text="Analytics", command=lambda: self.show_frame("stats"))
+        self.btn_stats.pack(pady=10, padx=20)
+
+        # Main Content Area
+        self.container = ctk.CTkFrame(self, fg_color="#1e1e1e")
+        self.container.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
+        self.container.grid_columnconfigure(0, weight=1)
+        self.container.grid_rowconfigure(0, weight=1)
+
+        self.frames = {}
+        self.init_frames()
+        self.show_frame("add")
+
+    def init_frames(self):
+        # --- Add Expense Frame ---
+        f_add = ctk.CTkFrame(self.container, fg_color="transparent")
+        ctk.CTkLabel(f_add, text="Record New Expense", font=ctk.CTkFont(size=24, weight="bold")).pack(pady=20)
+
+        form = ctk.CTkFrame(f_add, fg_color="#2d2d2d")
+        form.pack(pady=10, padx=40, fill="both")
+
+        ctk.CTkLabel(form, text="Select Person:").pack(pady=(10, 0))
+        users = self.data_manager.get_users()
+        self.user_cb = ctk.CTkComboBox(form, values=users, width=250)
+        self.user_cb.set(users[0])  # Set to first user (Default User)
+        self.user_cb.pack(pady=5, padx=20)
+
+        ctk.CTkLabel(form, text="Amount ($):").pack(pady=(10, 0))
+        self.amt_ent = ctk.CTkEntry(form, placeholder_text="0.00", width=250)
+        self.amt_ent.pack(pady=5, padx=20)
+
+        ctk.CTkLabel(form, text="Category:").pack(pady=(10, 0))
+        self.cat_cb = ctk.CTkComboBox(form,
+                                      values=["Food", "Travel", "Bills", "Shopping", "Health", "Education", "Other"],
+                                      width=250)
+        self.cat_cb.set("Food")
+        self.cat_cb.pack(pady=5, padx=20)
+
+        ctk.CTkLabel(form, text="Description:").pack(pady=(10, 0))
+        self.desc_ent = ctk.CTkEntry(form, placeholder_text="Note...", width=250)
+        self.desc_ent.pack(pady=5, padx=20)
+
+        ctk.CTkButton(form, text="Save Expense", fg_color="#27ae60", hover_color="#219150",
+                      command=self.save_expense).pack(pady=30)
+        self.frames["add"] = f_add
+
+        # --- View History Frame ---
+        f_view = ctk.CTkFrame(self.container, fg_color="transparent")
+        header = ctk.CTkFrame(f_view, fg_color="transparent")
+        header.pack(fill="x", pady=10)
+        ctk.CTkLabel(header, text="Expense History", font=ctk.CTkFont(size=24, weight="bold")).pack(side="left",
+                                                                                                    padx=20)
+
+        self.filter_cb = ctk.CTkComboBox(header, values=["All Users"] + self.data_manager.get_users(),
+                                         command=self.update_filter)
+        self.filter_cb.set("All Users")
+        self.filter_cb.pack(side="right", padx=20)
+
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Treeview", background="#2b2b2b", foreground="white", fieldbackground="#2b2b2b", borderwidth=0,
+                        rowheight=30, font=('Arial', 10))
+        style.configure("Treeview.Heading", background="#34495e", foreground="white", font=('Arial', 11, 'bold'))
+        style.map("Treeview", background=[('selected', '#3498db')])
+
+        self.tree = ttk.Treeview(f_view, columns=("User", "Date", "Category", "Amount", "Description"), show='headings')
+        for col in ("User", "Date", "Category", "Amount", "Description"):
+            self.tree.heading(col, text=col)
+            self.tree.column(col, anchor="center")
+
+        self.tree.pack(pady=10, padx=20, fill="both", expand=True)
+        self.frames["view"] = f_view
+
+        # --- Analytics Frame ---
+        f_stats = ctk.CTkFrame(self.container, fg_color="transparent")
+        stat_header = ctk.CTkFrame(f_stats, fg_color="transparent")
+        stat_header.pack(fill="x", pady=10)
+        ctk.CTkLabel(stat_header, text="Visual Analytics", font=ctk.CTkFont(size=24, weight="bold")).pack(side="left",
+                                                                                                          padx=20)
+
+        self.stat_filter_cb = ctk.CTkComboBox(stat_header, values=["All Users"] + self.data_manager.get_users(),
+                                              command=self.update_stat_filter)
+        self.stat_filter_cb.set("All Users")
+        self.stat_filter_cb.pack(side="right", padx=20)
+
+        self.scroll_canvas = ctk.CTkScrollableFrame(f_stats, fg_color="#1e1e1e")
+        self.scroll_canvas.pack(fill="both", expand=True, padx=10, pady=10)
+        self.frames["stats"] = f_stats
+
+    def add_new_user_dialog(self):
+        dialog = ctk.CTkInputDialog(text="Enter Name of New Person:", title="Add Person")
+        name = dialog.get_input()
+        if name:
+            if self.data_manager.add_user(name):
+                users = self.data_manager.get_users()
+                self.user_cb.configure(values=users)
+                self.filter_cb.configure(values=["All Users"] + users)
+                self.stat_filter_cb.configure(values=["All Users"] + users)
+                messagebox.showinfo("Success", f"Added {name} to Database and Backup.")
+            else:
+                messagebox.showwarning("Error", "User already exists.")
+
+    def show_frame(self, name):
+        for f in self.frames.values(): f.pack_forget()
+        self.frames[name].pack(fill="both", expand=True)
+        if name == "view": self.refresh_table()
+        if name == "stats": self.refresh_charts()
+
+    def save_expense(self):
+        try:
+            user = self.user_cb.get()
+            amt_str = self.amt_ent.get()
+            if not amt_str: return
+            amt = float(amt_str)
+
+            # NumPy Usage: Numerical check
+            if np.array([amt])[0] <= 0: raise ValueError
+
+            self.data_manager.add_expense(user, amt, self.cat_cb.get(), self.desc_ent.get())
+            messagebox.showinfo("Success", "Expense saved to MongoDB and History Backup!")
+            self.amt_ent.delete(0, tk.END)
+            self.desc_ent.delete(0, tk.END)
+        except ValueError:
+            messagebox.showerror("Error", "Please enter a valid positive amount.")
+
+    def update_filter(self, val):
+        self.current_user_filter = val
+        self.refresh_table()
+
+    def update_stat_filter(self, val):
+        self.current_user_filter = val
+        self.refresh_charts()
+
+    def refresh_table(self):
+        for i in self.tree.get_children(): self.tree.delete(i)
+        data = self.data_manager.get_expenses(self.current_user_filter)
+        if data:
+            # Pandas Usage: Data Handling
+            df = pd.DataFrame(data)
+            for _, r in df.iterrows():
+                self.tree.insert("", tk.END,
+                                 values=(r['user'], r['date'], r['category'], f"${r['amount']:.2f}", r['description']))
+
+    def refresh_charts(self):
+        for w in self.scroll_canvas.winfo_children(): w.destroy()
+        data = self.data_manager.get_expenses(self.current_user_filter)
+        if not data:
+            ctk.CTkLabel(self.scroll_canvas, text="No data available for charts.").pack(pady=50)
+            return
+
+        df = pd.DataFrame(data)
+        # Matplotlib Usage: Visualization
+        self.create_chart_container("Spending Distribution (Pie Chart)", df, "pie")
+        self.create_chart_container("Category-wise Totals (Bar Chart)", df, "bar")
+        self.create_chart_container("Spending Trend (Line Chart)", df, "line")
+
+    def create_chart_container(self, title, df, type):
+        container = ctk.CTkFrame(self.scroll_canvas, fg_color="#2d2d2d", corner_radius=10)
+        container.pack(fill="x", pady=10, padx=10)
+        ctk.CTkLabel(container, text=title, font=ctk.CTkFont(size=16, weight="bold"), text_color="#ecf0f1").pack(pady=5)
+
+        fig, ax = plt.subplots(figsize=(6, 4), dpi=100)
+        fig.patch.set_facecolor('#2d2d2d')
+        ax.set_facecolor('#2d2d2d')
+
+        plt.rcParams['text.color'] = 'white'
+        plt.rcParams['axes.labelcolor'] = 'white'
+        plt.rcParams['xtick.color'] = 'white'
+        plt.rcParams['ytick.color'] = 'white'
+
+        if type == "pie":
+            sums = df.groupby('category')['amount'].sum()
+            sums.plot(kind='pie', autopct='%1.1f%%', ax=ax, colors=plt.cm.Paired.colors,
+                      textprops={'color': "white", 'weight': 'bold'})
+            ax.set_ylabel('')
+        elif type == "bar":
+            sums = df.groupby('category')['amount'].sum()
+            sums.plot(kind='bar', ax=ax, color='#3498db')
+            ax.set_xlabel('Category', color='white')
+            ax.set_ylabel('Total Amount ($)', color='white')
+            plt.xticks(rotation=45)
+        elif type == "line":
+            df['date'] = pd.to_datetime(df['date'])
+            trend = df.groupby('date')['amount'].sum().sort_index()
+            trend.plot(kind='line', marker='o', ax=ax, color='#e74c3c', linewidth=2)
+            ax.set_xlabel('Date', color='white')
+            ax.set_ylabel('Daily Total ($)', color='white')
+            plt.xticks(rotation=45)
+
+        plt.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=container)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True, pady=5)
+
+
+if __name__ == "__main__":
+    app = ExpenseTrackerApp()
+    app.mainloop()   
